@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22d3ee" />
+      <stop offset="100%" stop-color="#0891b2" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#bg)" />
+  <rect width="496" height="496" x="8" y="8" rx="120" fill="none" stroke="#1e293b" stroke-width="4" />
+  <!-- Car Silhouette & Pulse -->
+  <g transform="translate(64, 96)">
+    <!-- Speedometer Arc -->
+    <path d="M 64 210 A 130 130 0 0 1 320 210" fill="none" stroke="#334155" stroke-width="24" stroke-linecap="round" />
+    <path d="M 64 210 A 130 130 0 0 1 240 96" fill="none" stroke="url(#cyanGrad)" stroke-width="24" stroke-linecap="round" />
+    <!-- Car Body -->
+    <path d="M 40 240 C 40 210 70 200 110 200 L 150 150 C 165 135 185 130 210 130 L 260 130 C 285 130 300 140 315 155 L 345 200 C 370 205 385 220 385 240 L 385 270 C 385 285 375 290 360 290 L 350 290 C 350 265 330 245 305 245 C 280 245 260 265 260 290 L 165 290 C 165 265 145 245 120 245 C 95 245 75 265 75 290 L 60 290 C 45 290 40 280 40 270 Z" fill="url(#cyanGrad)" />
+    <!-- Wheels -->
+    <circle cx="120" cy="290" r="32" fill="#020617" stroke="#22d3ee" stroke-width="12" />
+    <circle cx="305" cy="290" r="32" fill="#020617" stroke="#22d3ee" stroke-width="12" />
+  </g>
+</svg>

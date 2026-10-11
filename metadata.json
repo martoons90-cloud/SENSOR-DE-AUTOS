@@ -1,0 +1,6 @@
+{
+  "name": "AutoScan Pro - Diagnóstico ELM327, Turnos & Mantenimiento Inteligente",
+  "description": "App integral para conductores con extracción de telemetría ELM327 OBD-II en tiempo real, detección y traducción simple de códigos de falla P, alertas de fluidos y motor, asistente de ahorro de combustible, comparador de talleres y lubricentros con turnos integrados e historial preventivo.",
+  "requestFramePermissions": ["bluetooth"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "AutoSense - Conocer y Cuidar tu Auto",
+  "short_name": "AutoSense",
+  "description": "Entendé qué le pasa a tu auto, cómo lo estás usando y qué conviene revisar antes de que un aviso se convierta en un problema.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#020617",
+  "theme_color": "#06b6d4",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
