@@ -1,12 +1,22 @@
 import React, { useState, useEffect } from 'react';
-import { Terminal, Send, RefreshCw, Trash2, ShieldAlert, Cpu, Radio, Play, Pause, Info } from 'lucide-react';
-import { elm327Service, RawTerminalMessage } from '../../services/elm327Bluetooth';
+import { Terminal, Send, RefreshCw, Trash2, ShieldAlert, Cpu, Radio, Play, Pause, Info, Download } from 'lucide-react';
+import { elm327Service, RawTerminalMessage, SensorTestCircuitReport, StandardPidDiscoveryReport } from '../../services/elm327Bluetooth';
+import { exportSensorTestCircuit, exportStandardPidDiscovery, exportTelemetrySession } from '../../services/telemetryExportService';
 
 export const RawTerminalView: React.FC = () => {
   const [logs, setLogs] = useState<RawTerminalMessage[]>([]);
   const [customCommand, setCustomCommand] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isAutoPolling, setIsAutoPolling] = useState(elm327Service.isAutoPolling());
+  const [historyCount, setHistoryCount] = useState(elm327Service.getTelemetryHistory().length);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [isRunningCircuit, setIsRunningCircuit] = useState(false);
+  const [circuitProgress, setCircuitProgress] = useState<string | null>(null);
+  const [lastCircuitReport, setLastCircuitReport] = useState<SensorTestCircuitReport | null>(null);
+  const [isDiscoveringPids, setIsDiscoveringPids] = useState(false);
+  const [discoveryProgress, setDiscoveryProgress] = useState<string | null>(null);
+  const [lastDiscoveryReport, setLastDiscoveryReport] = useState<StandardPidDiscoveryReport | null>(null);
 
   useEffect(() => {
     const unsubLogs = elm327Service.subscribeLogs((msg) => {
@@ -14,6 +24,7 @@ export const RawTerminalView: React.FC = () => {
     });
     const unsubTel = elm327Service.subscribe((t) => {
       setIsAutoPolling(!!t.isAutoPolling);
+      setHistoryCount(elm327Service.getTelemetryHistory().length);
     });
     return () => {
       unsubLogs();
@@ -37,6 +48,98 @@ export const RawTerminalView: React.FC = () => {
 
   const handleClearLogs = () => {
     setLogs([]);
+  };
+
+  const handleExportHistory = async () => {
+    const report = elm327Service.getDiagnosticExport();
+    if (report.samples.length === 0) {
+      setExportMessage('Todavía no hay lecturas para exportar. Conectá la camioneta y circulá unos minutos.');
+      return;
+    }
+    setIsExporting(true);
+    setExportMessage(null);
+    try {
+      const result = await exportTelemetrySession(report);
+      setExportMessage(result.shared
+        ? `Historial listo: ${report.samples.length} lecturas. Elegí WhatsApp, Drive o Archivos para enviarlo.`
+        : `Archivo descargado: ${result.filename}`);
+    } catch (error: any) {
+      setExportMessage(`No se pudo exportar: ${error?.message || 'error desconocido'}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleClearDiagnosticHistory = () => {
+    elm327Service.clearDiagnosticHistory();
+    setLogs([]);
+    setHistoryCount(0);
+    setExportMessage('Historial de diagnóstico eliminado.');
+  };
+
+  const handleRunSensorCircuit = async () => {
+    setIsRunningCircuit(true);
+    setLastCircuitReport(null);
+    setCircuitProgress('Preparando prueba de 10 sensores × 2 vueltas...');
+    try {
+      const report = await elm327Service.runSensorTestCircuit(2, (completed, total, label) => {
+        setCircuitProgress(`Leyendo ${label} (${completed}/${total})...`);
+      });
+      setLastCircuitReport(report);
+      setCircuitProgress(`Prueba terminada: ${report.readings.length} respuestas reales registradas.`);
+    } catch (error: any) {
+      setCircuitProgress(`No se pudo iniciar la prueba: ${error?.message || 'error desconocido'}`);
+    } finally {
+      setIsRunningCircuit(false);
+    }
+  };
+
+  const handleExportCircuit = async () => {
+    if (!lastCircuitReport) return;
+    setIsExporting(true);
+    try {
+      const result = await exportSensorTestCircuit(lastCircuitReport);
+      setCircuitProgress(result.shared
+        ? 'Resultado listo. Elegí Archivos, WhatsApp o Drive para guardarlo o enviarlo.'
+        : `Resultado descargado: ${result.filename}`);
+    } catch (error: any) {
+      setCircuitProgress(`No se pudo descargar el resultado: ${error?.message || 'error desconocido'}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleDiscoverStandardPids = async () => {
+    setIsDiscoveringPids(true);
+    setLastDiscoveryReport(null);
+    setDiscoveryProgress('Leyendo la lista de capacidades que declara la ECU...');
+    try {
+      const report = await elm327Service.runStandardPidDiscovery((completed, total, label) => {
+        setDiscoveryProgress(`Probando ${label} (${completed}/${total})...`);
+      });
+      setLastDiscoveryReport(report);
+      const withData = report.readings.filter((reading) => reading.result === 'datos').length;
+      setDiscoveryProgress(`Inventario terminado: ${withData}/${report.readings.length} PIDs devolvieron datos. Incluye temperatura de aceite (01 5C).`);
+    } catch (error: any) {
+      setDiscoveryProgress(`No se pudo iniciar el inventario: ${error?.message || 'error desconocido'}`);
+    } finally {
+      setIsDiscoveringPids(false);
+    }
+  };
+
+  const handleExportPidDiscovery = async () => {
+    if (!lastDiscoveryReport) return;
+    setIsExporting(true);
+    try {
+      const result = await exportStandardPidDiscovery(lastDiscoveryReport);
+      setDiscoveryProgress(result.shared
+        ? 'Inventario listo. Elegí Archivos, WhatsApp o Drive para guardarlo o enviarlo.'
+        : `Inventario descargado: ${result.filename}`);
+    } catch (error: any) {
+      setDiscoveryProgress(`No se pudo descargar el inventario: ${error?.message || 'error desconocido'}`);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const handleToggleAutoPoll = () => {
@@ -85,13 +188,37 @@ export const RawTerminalView: React.FC = () => {
           </button>
 
           <button
+            onClick={handleExportHistory}
+            disabled={isExporting || historyCount === 0}
+            className="px-3.5 py-2 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 shrink-0"
+            title="Genera un archivo con todas las lecturas y tramas ELM327 para compartir"
+          >
+            <Download className={`w-3.5 h-3.5 ${isExporting ? 'animate-bounce' : ''}`} />
+            <span>{isExporting ? 'Preparando...' : `Exportar (${historyCount})`}</span>
+          </button>
+
+          <button
             onClick={handleClearLogs}
             className="px-3.5 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold border border-slate-700 transition-colors flex items-center gap-1.5 shrink-0"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            <span>Limpiar</span>
+            <span>Limpiar pantalla</span>
           </button>
         </div>
+      </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div>
+          <p className="font-bold text-white">Bitácora de viaje y diagnóstico</p>
+          <p className="text-slate-400 mt-0.5">Se guarda en el teléfono una muestra por segundo: velocidad, RPM, MAP, MAF, carga, acelerador y tramas ELM327.</p>
+          {exportMessage && <p className="text-cyan-300 mt-1.5">{exportMessage}</p>}
+        </div>
+        <button
+          onClick={handleClearDiagnosticHistory}
+          className="px-3 py-2 rounded-xl border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 font-semibold shrink-0"
+        >
+          Borrar historial
+        </button>
       </div>
 
       {/* Auto-Polling Clarification Notice */}
@@ -117,6 +244,66 @@ export const RawTerminalView: React.FC = () => {
         </div>
       </div>
 
+      <div className="bg-slate-900 border border-cyan-800/60 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <p className="font-bold text-white">Prueba completa de sensores</p>
+          <p className="text-xs text-slate-400 mt-1">
+            Consulta RPM, velocidad, temperatura, carga, acelerador, MAP, MAF, IAT, avance y voltaje; repite la vuelta dos veces y registra cada respuesta real.
+          </p>
+          {circuitProgress && <p className="text-xs text-cyan-300 mt-2 font-medium">{circuitProgress}</p>}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleRunSensorCircuit}
+            disabled={isRunningCircuit}
+            className="px-3.5 py-2 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isRunningCircuit ? 'animate-spin' : ''}`} />
+            <span>{isRunningCircuit ? 'Probando...' : 'Probar 10 sensores × 2'}</span>
+          </button>
+          {lastCircuitReport && (
+            <button
+              onClick={handleExportCircuit}
+              disabled={isExporting}
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-750 disabled:opacity-50 text-cyan-300 border border-slate-700 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5"
+            >
+              <Download className={`w-3.5 h-3.5 ${isExporting ? 'animate-bounce' : ''}`} />
+              <span>Descargar resultado</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-slate-900 border border-violet-800/60 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <p className="font-bold text-white">Inventario completo de sensores de la ECU</p>
+          <p className="text-xs text-slate-400 mt-1">
+            Lee los mapas estándar 0100, 0120, 0140… y prueba cada PID que la ECU declara. También verifica datos importantes aunque no estén anunciados, como temperatura de aceite (01 5C), presión barométrica y presión de riel.
+          </p>
+          {discoveryProgress && <p className="text-xs text-violet-300 mt-2 font-medium">{discoveryProgress}</p>}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleDiscoverStandardPids}
+            disabled={isDiscoveringPids || isRunningCircuit}
+            className="px-3.5 py-2 bg-violet-500 hover:bg-violet-400 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isDiscoveringPids ? 'animate-spin' : ''}`} />
+            <span>{isDiscoveringPids ? 'Explorando...' : 'Explorar todos'}</span>
+          </button>
+          {lastDiscoveryReport && (
+            <button
+              onClick={handleExportPidDiscovery}
+              disabled={isExporting}
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-750 disabled:opacity-50 text-violet-200 border border-slate-700 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5"
+            >
+              <Download className={`w-3.5 h-3.5 ${isExporting ? 'animate-bounce' : ''}`} />
+              <span>Descargar inventario</span>
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Quick Command Presets */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2">
         <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
@@ -134,6 +321,9 @@ export const RawTerminalView: React.FC = () => {
             { label: '010D (Velocidad)', cmd: '01 0D' },
             { label: '0105 (Temp Agua)', cmd: '01 05' },
             { label: '0104 (Carga Motor)', cmd: '01 04' },
+            { label: '010B (MAP)', cmd: '01 0B' },
+            { label: '0110 (MAF)', cmd: '01 10' },
+            { label: '0111 (Acelerador)', cmd: '01 11' },
             { label: '012F (Nivel Tanque)', cmd: '01 2F' },
             { label: '03 (Leer Fallas DTC)', cmd: '03' },
             { label: 'ATRV (Voltaje Batería)', cmd: 'ATRV' },

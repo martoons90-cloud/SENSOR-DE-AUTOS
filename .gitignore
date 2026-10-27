@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Generated installers and desktop packaging output (source remains tracked)
+*.apk
+Sensor-de-Autos-Notebook/
+release/
+release-desktop/

@@ -53,7 +53,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [activeMode, setActiveMode] = useState<SimulatorDrivingMode>('crucero_autopista');
   const [isChangingProtocol, setIsChangingProtocol] = useState(false);
   const [protocolMessage, setProtocolMessage] = useState<string | null>(null);
-  const [isReadingRpm, setIsReadingRpm] = useState(false);
+  const [refreshingSensorPid, setRefreshingSensorPid] = useState<string | null>(null);
   const [pollMode, setPollMode] = useState<'rpm_only' | 'all'>(elm327Service.getPollMode());
 
   // Fuel level calibration states
@@ -65,6 +65,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   // ECU Sensors Modal states
   const [isSensorsModalOpen, setIsSensorsModalOpen] = useState(false);
   const [sensorCategoryFilter, setSensorCategoryFilter] = useState<string>('todos');
+  // The catalogue contains explanations for many possible PIDs, but the live
+  // screen must only present sensors the current ECU has actually declared or
+  // answered. This keeps Nissan-specific examples out until they are real.
+  const detectedSensors = (telemetry.supportedSensorsList || []).filter(sensor => sensor.isSupported);
+  const pinnedDetectedSensors = detectedSensors.filter(sensor => sensor.isPinned);
 
   useEffect(() => {
     if (!isFuelModalOpen && telemetry.fuelLevelPercent !== null && telemetry.fuelLevelPercent !== undefined) {
@@ -104,11 +109,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   }, [telemetry.connectionState]);
 
   const handleManualReadRpm = async () => {
-    setIsReadingRpm(true);
+    setRefreshingSensorPid('0C');
     try {
       await elm327Service.pollRPMNow();
     } finally {
-      setIsReadingRpm(false);
+      setRefreshingSensorPid(null);
+    }
+  };
+
+  const handleRefreshSensor = async (pid: string) => {
+    setRefreshingSensorPid(pid);
+    try {
+      await elm327Service.pollSensorNow(pid);
+    } finally {
+      setRefreshingSensorPid(null);
     }
   };
 
@@ -155,11 +169,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return '5ª';
   };
 
-  const currentGear = calculateGear(telemetry.speed, telemetry.rpm);
+  const hasLiveEcuData = telemetry.connectionState === 'simulated' || telemetry.ecuStatus === 'connected';
+  const currentGear = hasLiveEcuData ? calculateGear(telemetry.speed, telemetry.rpm) : '--';
   const isHighTemp = telemetry.coolantTemp > 102;
   const isColdTemp = telemetry.coolantTemp < 75;
   const isLowFuel = telemetry.fuelLevelPercent !== null && telemetry.fuelLevelSensorStatus !== 'unsupported_by_ecu' && telemetry.fuelLevelPercent < 15;
   const isBatteryOk = telemetry.batteryVoltage >= 13.5 && telemetry.batteryVoltage <= 14.8;
+  const isReadingRpm = refreshingSensorPid === '0C';
+  const isReadingSpeed = refreshingSensorPid === '0D';
 
   return (
     <div className="space-y-3.5 max-w-2xl mx-auto">
@@ -167,12 +184,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <div className="bg-slate-900/90 border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between gap-2 shadow-md">
         <div className="flex items-center gap-2 min-w-0">
           <span className="relative flex h-2.5 w-2.5 shrink-0">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+            {hasLiveEcuData && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>}
+            <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${hasLiveEcuData ? 'bg-emerald-500' : 'bg-amber-400'}`}></span>
           </span>
           <div className="truncate">
             <div className="flex items-center gap-1.5">
-              <span className="text-xs font-bold text-white tracking-tight">EN VIVO</span>
+              <span className="text-xs font-bold text-white tracking-tight">{hasLiveEcuData ? 'EN VIVO' : 'ESPERANDO ECU'}</span>
               <span className="text-[10px] text-slate-400 truncate">
                 · {vehicle.brand} {vehicle.model}
               </span>
@@ -189,8 +206,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           >
             <Activity className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
             <span>
-              Sensores: <strong className="text-white font-mono">{telemetry.supportedSensorsCount || 16}</strong>
-              <span className="text-[10px] text-emerald-400 ml-1 font-mono hidden sm:inline">({telemetry.activeSensorsCount || 6} en vivo)</span>
+                Sensores: <strong className="text-white font-mono">{telemetry.supportedSensorsCount ?? 0}</strong>
+                <span className="text-[10px] text-emerald-400 ml-1 font-mono hidden sm:inline">({telemetry.activeSensorsCount ?? 0} en vivo)</span>
             </span>
             <ChevronRight className="w-3 h-3 text-slate-400" />
           </button>
@@ -205,10 +222,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span>{telemetry.activeDtcsCount} {telemetry.activeDtcsCount === 1 ? 'Falla' : 'Fallas'}</span>
               <ChevronRight className="w-3 h-3 text-amber-400/80" />
             </button>
-          ) : (
+          ) : hasLiveEcuData ? (
             <div className="shrink-0 px-2.5 py-1 text-[11px] font-medium bg-emerald-950/70 border border-emerald-800/60 text-emerald-300 rounded-lg flex items-center gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="hidden sm:inline">Sistema OK</span>
+              <span className="hidden sm:inline">Sin DTC leídos</span>
+            </div>
+          ) : (
+            <div className="shrink-0 px-2.5 py-1 text-[11px] font-medium bg-amber-950/70 border border-amber-800/60 text-amber-300 rounded-lg flex items-center gap-1.5">
+              <Activity className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">Sin datos ECU</span>
             </div>
           )}
         </div>
@@ -337,12 +359,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="flex items-center gap-2">
             <button
               onClick={handleManualReadRpm}
-              disabled={isReadingRpm}
+              disabled={refreshingSensorPid !== null}
               className="px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 active:scale-95 disabled:opacity-50 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 transition-all cursor-pointer"
               title="Solicitar lectura inmediata de RPM a la ECU"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isReadingRpm ? 'animate-spin' : ''}`} />
               <span>{isReadingRpm ? 'Leyendo...' : '⚡ Leer RPM Ahora'}</span>
+            </button>
+
+            <button
+              onClick={() => handleRefreshSensor('0D')}
+              disabled={refreshingSensorPid !== null}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 active:scale-95 disabled:opacity-50 text-cyan-200 border border-cyan-800/70 font-bold rounded-xl text-xs flex items-center gap-1.5 transition-all cursor-pointer"
+              title="Actualizar velocidad para refrescar también la marcha estimada"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isReadingSpeed ? 'animate-spin' : ''}`} />
+              <span>{isReadingSpeed ? 'Leyendo...' : 'Velocidad'}</span>
             </button>
 
             {telemetry.connectionState === 'connected' && (
@@ -610,7 +642,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="text-xs font-bold text-white flex items-center gap-2">
                 <span>Sensores Monitoreados en Vivo</span>
                 <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-cyan-950 text-cyan-300 border border-cyan-700/80">
-                  {((telemetry.supportedSensorsList || []).filter(s => s.isPinned)).length} MARCADOS
+                  {pinnedDetectedSensors.length} DETECTADOS
                 </span>
               </span>
             </div>
@@ -628,10 +660,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {((telemetry.supportedSensorsList || []).filter(s => s.isPinned)).length > 0 ? (
+        {pinnedDetectedSensors.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 sm:gap-3">
-            {(telemetry.supportedSensorsList || [])
-              .filter(s => s.isPinned)
+            {pinnedDetectedSensors
               .map(sensor => {
                 const isFuel = sensor.pid.includes('2F');
                 const health = evaluateSensorHealth(
@@ -955,7 +986,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-bold text-white">Sensores Detectados en la ECU</span>
                   <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-cyan-950 text-cyan-300 border border-cyan-700">
-                    {telemetry.supportedSensorsCount || 16} COMPATIBLES
+                    {telemetry.supportedSensorsCount ?? 0} COMPATIBLES
                   </span>
                   <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-700">
                     {telemetry.activeSensorsCount || 6} EN VIVO
@@ -970,7 +1001,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               onClick={() => setIsSensorsModalOpen(true)}
               className="w-full sm:w-auto px-3.5 py-1.5 rounded-xl bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 text-xs font-semibold border border-cyan-500/40 flex items-center justify-center gap-1.5 transition-colors cursor-pointer shrink-0 shadow-sm"
             >
-              <span>Ver {telemetry.supportedSensorsCount || 16} Sensores</span>
+              <span>Ver {telemetry.supportedSensorsCount ?? 0} Sensores</span>
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -1081,7 +1112,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          {/* Diagnostic Note for Nissan / Diesel 2006 */}
+          {/* Diagnostic Note for Nissan Frontier NP300 diesel */}
           {telemetry.ecuStatus !== 'connected' && (
             <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-600/40 text-xs text-amber-200 space-y-2">
               <div className="flex items-start gap-2">
@@ -1095,7 +1126,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       <strong>Llave en CONTACTO:</strong> La llave debe estar en la segunda posición (con todos los testigos del tablero prendidos) o con el motor encendido. En posición radio (ACC) la ECU está apagada.
                     </li>
                     <li>
-                      <strong>Protocolo para Nissan Diésel 2006:</strong> Las camionetas Nissan Frontier / Mercosur con inyección electrónica suelen usar <strong>KWP2000 Fast Init</strong> o <strong>KWP 5-baud</strong> en lugar de CAN.
+                      <strong>Protocolo para tu Frontier NP300 2013:</strong> Puede trabajar con KWP2000 o CAN según la ECU. La app primero prueba detección automática; solo forzá un protocolo si la consola muestra “NO DATA”.
                     </li>
                     <li>
                       <strong>Si tiene Bomba Mecánica (MWM 2.8 tradicional):</strong> La inyección es 100% mecánica sin ECU de motor; en ese caso el puerto OBD2 no transmite RPM.
@@ -1274,14 +1305,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </button>
             </div>
 
-            {/* Explanation card for 2006 vehicles */}
+            {/* Explanation card for the Frontier fuel sender */}
             <div className="p-3.5 rounded-2xl bg-amber-950/40 border border-amber-700/50 space-y-1.5 text-xs text-amber-200">
               <div className="flex items-center gap-1.5 font-bold text-amber-300">
                 <Info className="w-4 h-4 shrink-0 text-amber-400" />
                 <span>¿Por qué la ECU no lo lee automáticamente?</span>
               </div>
               <p className="text-[11px] leading-relaxed text-amber-200/90">
-                En modelos <strong>2006</strong> (como la Nissan Frontier), el sensor flotante del tanque está conectado por cable analógico <strong>directamente a la aguja del tablero</strong> y nunca pasa por la computadora del motor (ECU). Por eso el escáner devuelve <code>NO DATA</code> en el PID <code>01 2F</code>.
+                En muchas Frontier NP300, el sensor flotante del tanque está conectado por cable analógico <strong>directamente a la aguja del tablero</strong> y puede no pasar por la computadora del motor (ECU). Si el escáner devuelve <code>NO DATA</code> en el PID <code>01 2F</code>, es esperable.
               </p>
               <p className="text-[11px] leading-relaxed text-amber-200/90">
                 Seleccioná acá la posición aproximada de tu aguja para que la app calcule tu <strong>autonomía restante en km</strong> y el consumo exacto:
@@ -1400,7 +1431,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <h3 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
                     <span>Sensores Detectados en la ECU</span>
                     <span className="text-[11px] px-2 py-0.5 rounded-full font-mono font-bold bg-cyan-950 text-cyan-300 border border-cyan-700">
-                      {telemetry.supportedSensorsCount || 16} COMPATIBLES
+                      {telemetry.supportedSensorsCount ?? 0} COMPATIBLES
                     </span>
                   </h3>
                   <span className="text-xs text-slate-400">
@@ -1423,7 +1454,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800">
                   <span className="w-2 h-2 rounded-full bg-cyan-400" />
                   <span className="text-slate-400">Compatibles:</span>
-                  <strong className="text-white font-mono">{telemetry.supportedSensorsCount || 16}</strong>
+                  <strong className="text-white font-mono">{telemetry.supportedSensorsCount ?? 0}</strong>
                 </div>
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/60 border border-emerald-800/60">
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -1434,7 +1465,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <CheckSquare className="w-3.5 h-3.5 text-cyan-400" />
                   <span className="text-cyan-300">En Tablero:</span>
                   <strong className="text-cyan-100 font-mono">
-                    {((telemetry.supportedSensorsList || []).filter(s => s.isPinned)).length}
+                    {pinnedDetectedSensors.length}
                   </strong>
                 </div>
               </div>
@@ -1475,7 +1506,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="p-3 mx-4 my-2.5 rounded-xl bg-cyan-950/30 border border-cyan-800/40 text-[11px] text-cyan-200/90 leading-relaxed flex items-start gap-2">
               <Info className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
               <div>
-                <strong className="text-white">¿Cómo verlos en el tablero en vivo?</strong> Hacé clic en el botón <strong>"Mostrar en Tablero (Check)"</strong> de cualquier sensor para que aparezca fijado en la grilla principal de tu tablero en tiempo real.
+                <strong className="text-white">Sensores confirmados por la ECU.</strong> Al conectar, la app consulta el mapa estándar del vehículo y muestra automáticamente solo los sensores que esa computadora admite. Podés quitar cualquiera del tablero si no te interesa verlo.
               </div>
             </div>
 
@@ -1483,7 +1514,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="px-4 pb-2 flex gap-1.5 overflow-x-auto text-xs no-scrollbar">
               {[
                 { id: 'todos', label: 'Todos' },
-                { id: 'fijados', label: `★ En Tablero (${(telemetry.supportedSensorsList || []).filter(s => s.isPinned).length})` },
+                { id: 'fijados', label: `★ En Tablero (${pinnedDetectedSensors.length})` },
                 { id: 'Motor', label: 'Motor' },
                 { id: 'Combustible', label: 'Combustible' },
                 { id: 'Admisión / Aire', label: 'Admisión' },
@@ -1506,12 +1537,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
             {/* Scrollable Sensors List */}
             <div className="p-4 pt-1 overflow-y-auto space-y-2 flex-1 max-h-[50vh]">
-              {(telemetry.supportedSensorsList || []).filter(s => {
+              {detectedSensors.filter(s => {
                 if (sensorCategoryFilter === 'todos') return true;
                 if (sensorCategoryFilter === 'fijados') return s.isPinned;
                 return s.category === sensorCategoryFilter;
               }).map(sensor => {
                 const isFuel = sensor.pid.includes('2F');
+                const canRefreshSensor = (sensor.isActive || sensor.pid === '0C' || sensor.pid === '0D')
+                  && (sensor.pid === 'ATRV' || /^[0-9A-F]{2}$/.test(sensor.pid));
+                const isRefreshingSensor = refreshingSensorPid === sensor.pid;
                 const health = evaluateSensorHealth(
                   sensor.pid,
                   sensor.numericValue,
@@ -1617,23 +1651,37 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
                     {/* Interactive Action Row: Pin Checkbox & Fuel Calibration Button */}
                     <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2 flex-wrap">
-                      <button
-                        type="button"
-                        onClick={() => elm327Service.togglePinnedSensor(sensor.pid)}
-                        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
-                          sensor.isPinned
-                            ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/60 shadow-sm'
-                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-600 hover:text-slate-200'
-                        }`}
-                        title={sensor.isPinned ? 'Desmarcar check para quitar del tablero' : 'Presionar check para mostrar en el tablero en vivo'}
-                      >
-                        {sensor.isPinned ? (
-                          <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
-                        ) : (
-                          <Square className="w-4 h-4 text-slate-500 shrink-0" />
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {canRefreshSensor && (
+                          <button
+                            type="button"
+                            onClick={() => handleRefreshSensor(sensor.pid)}
+                            disabled={refreshingSensorPid !== null}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold bg-cyan-500/15 text-cyan-200 border-cyan-500/40 hover:bg-cyan-500/25 disabled:opacity-50 transition-all cursor-pointer"
+                            title={`Consultar ${sensor.name} ahora mismo a la ECU`}
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSensor ? 'animate-spin' : ''}`} />
+                            <span>{isRefreshingSensor ? 'Leyendo...' : 'Actualizar'}</span>
+                          </button>
                         )}
-                        <span>{sensor.isPinned ? 'Mostrando en Tablero (Check ✓)' : 'Mostrar en Tablero (Check)'}</span>
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() => elm327Service.togglePinnedSensor(sensor.pid)}
+                          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-all cursor-pointer ${
+                            sensor.isPinned
+                              ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/60 shadow-sm'
+                              : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-600 hover:text-slate-200'
+                          }`}
+                          title={sensor.isPinned ? 'Desmarcar check para quitar del tablero' : 'Presionar check para mostrar en el tablero en vivo'}
+                        >
+                          {sensor.isPinned ? (
+                            <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
+                          ) : (
+                            <Square className="w-4 h-4 text-slate-500 shrink-0" />
+                          )}
+                          <span>{sensor.isPinned ? 'Mostrando en Tablero (Check ✓)' : 'Mostrar en Tablero (Check)'}</span>
+                        </button>
+                      </div>
 
                       {isFuel && (
                         <div className="flex items-center gap-2">
@@ -1655,12 +1703,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 );
               })}
+              {detectedSensors.length === 0 && (
+                <div className="py-10 text-center text-sm text-slate-400">
+                  Todavía no hay sensores confirmados. Conectá la ECU: la detección se hace automáticamente y no agrega datos estimados.
+                </div>
+              )}
             </div>
 
             {/* Modal Footer */}
             <div className="p-3.5 sm:p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-between">
               <span className="text-xs text-slate-400 font-mono">
-                {((telemetry.supportedSensorsList || []).filter(s => s.isPinned)).length} de {telemetry.supportedSensorsCount || 16} sensores marcados para el tablero
+                {pinnedDetectedSensors.length} de {telemetry.supportedSensorsCount ?? 0} sensores detectados en el tablero
               </span>
               <button
                 onClick={() => setIsSensorsModalOpen(false)}

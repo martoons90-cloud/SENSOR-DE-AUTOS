@@ -1,6 +1,8 @@
 import { OBDTelemetry, DTCFaultCode, ECUSensorInfo } from '../types/vehicle';
 import { UNIVERSAL_P_CODES, lookupDTC } from './obdDatabase';
 import { evaluateSensorHealth } from './sensorHealthEvaluator';
+import { Capacitor } from '@capacitor/core';
+import { BleClient, type BleCharacteristic, type BleService } from '@capacitor-community/bluetooth-le';
 
 export type SimulatorDrivingMode = 'crucero_autopista' | 'trafico_urbano' | 'ralenti' | 'deportivo' | 'falla_misfire' | 'falla_temperatura';
 
@@ -10,6 +12,72 @@ export interface RawTerminalMessage {
   text: string;
   timestamp: string;
 }
+
+export interface TelemetryHistoryEntry {
+  timestamp: string;
+  rpm: number;
+  speedKmh: number;
+  coolantTempC: number;
+  engineLoadPercent: number;
+  throttlePercent: number;
+  mapKpa: number;
+  mafGramsPerSecond: number;
+  intakeAirTempC: number;
+  batteryVoltage: number;
+  rawCommand: string;
+  rawResponse: string;
+}
+
+export interface TelemetryDiagnosticExport {
+  format: 'autosense-diagnostic-v1';
+  exportedAt: string;
+  samples: TelemetryHistoryEntry[];
+  communications: RawTerminalMessage[];
+}
+
+export interface SensorTestCircuitReading {
+  round: number;
+  label: string;
+  command: string;
+  response: string;
+  timestamp: string;
+}
+
+export interface SensorTestCircuitReport {
+  format: 'autosense-sensor-circuit-v1';
+  startedAt: string;
+  completedAt: string;
+  rounds: number;
+  readings: SensorTestCircuitReading[];
+}
+
+export interface StandardPidDiscoveryReading {
+  pid: string;
+  command: string;
+  source: 'anunciado_por_ecu' | 'prueba_extra';
+  response: string;
+  result: 'datos' | 'sin_datos' | 'sin_respuesta';
+  timestamp: string;
+}
+
+export interface StandardPidDiscoveryReport {
+  format: 'autosense-standard-pid-discovery-v1';
+  startedAt: string;
+  completedAt: string;
+  advertisedPids: string[];
+  readings: StandardPidDiscoveryReading[];
+}
+
+type ClassicBluetoothDevice = { id: string; name?: string; address?: string };
+
+type ClassicBluetoothSerial = {
+  list: (success: (devices: ClassicBluetoothDevice[]) => void, failure: (error: unknown) => void) => void;
+  connectInsecure: (address: string, success: () => void, failure: (error: unknown) => void) => void;
+  disconnect: (success?: () => void, failure?: (error: unknown) => void) => void;
+  write: (data: string, success?: () => void, failure?: (error: unknown) => void) => void;
+  subscribeRawData: (success: (data: ArrayBuffer | number) => void, failure?: (error: unknown) => void) => void;
+  unsubscribeRawData: (success?: () => void, failure?: (error: unknown) => void) => void;
+};
 
 export const STANDARD_OBD_SENSORS: Array<{
   pidHex: string;
@@ -61,6 +129,12 @@ export class ELM327Service {
   private gattServer: any = null;
   private txCharacteristic: any = null;
   private rxCharacteristic: any = null;
+  private nativeBleDeviceId: string | null = null;
+  private nativeBleServiceUuid: string | null = null;
+  private nativeBleTxCharacteristicUuid: string | null = null;
+  private nativeBleRxCharacteristicUuid: string | null = null;
+  private isNativeClassicConnection = false;
+  private nativeBluetoothInitialized = false;
   private rxBuffer: string = '';
   private rxResolver: ((val: string) => void) | null = null;
 
@@ -72,12 +146,21 @@ export class ELM327Service {
 
   private isPollingActive: boolean = false;
   private isBusySending: boolean = false;
+  // Every ELM327 has a single serial channel. Commands must be strictly
+  // serialized so a manual Raw command can never steal an automatic reply.
+  private commandQueue: Promise<void> = Promise.resolve();
   private autoPollPaused: boolean = false;
+  private isInitializingEcu: boolean = false;
+  private ecuReadyForPolling: boolean = false;
   private autoPollCount: number = 0;
   private simulationTimer: any = null;
   private pollMode: 'rpm_only' | 'all' = 'all';
   private supportedPidsSet: Set<string> = new Set();
+  // A PID is only considered live after its actual response arrived from the ECU.
+  // This prevents a compatible-but-not-yet-read sensor from displaying a value.
+  private receivedPidsSet: Set<string> = new Set();
   private pinnedPids: Set<string> = new Set();
+  private nextPrioritySensorIdx = 0;
   private secondaryPids: Array<{ pid: string; label: string; timeout: number }> = [
     { pid: '01 0D', label: 'Velocidad', timeout: 1500 },
     { pid: '01 05', label: 'Temp Refrigerante', timeout: 1500 },
@@ -98,6 +181,13 @@ export class ELM327Service {
 
   private listeners: Array<(telemetry: OBDTelemetry) => void> = [];
   private logListeners: Array<(msg: RawTerminalMessage) => void> = [];
+  private telemetryHistory: TelemetryHistoryEntry[] = [];
+  private communicationHistory: RawTerminalMessage[] = [];
+  private lastHistorySampleAt = 0;
+  private lastHistoryPersistAt = 0;
+  private readonly maxHistoryEntries = 7_200;
+  private readonly historyStorageKey = 'autosense_telemetry_history_v1';
+  private readonly communicationStorageKey = 'autosense_communication_history_v1';
 
   // Default clean telemetry (zeroed out, ready for real live data)
   private currentTelemetry: OBDTelemetry = {
@@ -222,6 +312,7 @@ export class ELM327Service {
   }
 
   constructor() {
+    this.loadTelemetryHistory();
     this.currentTelemetry.connectionState = 'disconnected';
     const savedFuel = this.getInitialFuelLevel();
     if (savedFuel !== null) {
@@ -263,7 +354,83 @@ export class ELM327Service {
       text,
       timestamp: new Date().toLocaleTimeString()
     };
+    this.communicationHistory.push(msg);
+    if (this.communicationHistory.length > 1_200) this.communicationHistory.splice(0, this.communicationHistory.length - 1_200);
+    this.persistTelemetryHistory();
     this.logListeners.forEach(cb => cb(msg));
+  }
+
+  private loadTelemetryHistory() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const samples = JSON.parse(localStorage.getItem(this.historyStorageKey) || '[]');
+      const communications = JSON.parse(localStorage.getItem(this.communicationStorageKey) || '[]');
+      if (Array.isArray(samples)) this.telemetryHistory = samples.slice(-this.maxHistoryEntries);
+      if (Array.isArray(communications)) this.communicationHistory = communications.slice(-1_200);
+    } catch (_) {
+      this.telemetryHistory = [];
+      this.communicationHistory = [];
+    }
+  }
+
+  private persistTelemetryHistory(force = false) {
+    if (typeof localStorage === 'undefined') return;
+    const now = Date.now();
+    if (!force && now - this.lastHistoryPersistAt < 10_000) return;
+    this.lastHistoryPersistAt = now;
+    try {
+      localStorage.setItem(this.historyStorageKey, JSON.stringify(this.telemetryHistory));
+      localStorage.setItem(this.communicationStorageKey, JSON.stringify(this.communicationHistory));
+    } catch (_) {
+      // The app can continue reading even if the device has no remaining local storage.
+    }
+  }
+
+  private captureTelemetryHistory() {
+    if (this.currentTelemetry.connectionState !== 'connected') return;
+    const now = Date.now();
+    if (now - this.lastHistorySampleAt < 1_000) return;
+    this.lastHistorySampleAt = now;
+
+    this.telemetryHistory.push({
+      timestamp: new Date(now).toISOString(),
+      rpm: this.currentTelemetry.rpm,
+      speedKmh: this.currentTelemetry.speed,
+      coolantTempC: this.currentTelemetry.coolantTemp,
+      engineLoadPercent: this.currentTelemetry.engineLoad,
+      throttlePercent: this.currentTelemetry.throttlePos,
+      mapKpa: this.currentTelemetry.intakePressureMap,
+      mafGramsPerSecond: this.currentTelemetry.mafRate,
+      intakeAirTempC: this.currentTelemetry.intakeAirTemp,
+      batteryVoltage: this.currentTelemetry.batteryVoltage,
+      rawCommand: this.currentTelemetry.lastCommandSent || '',
+      rawResponse: this.currentTelemetry.lastRawResponse || ''
+    });
+    if (this.telemetryHistory.length > this.maxHistoryEntries) {
+      this.telemetryHistory.splice(0, this.telemetryHistory.length - this.maxHistoryEntries);
+    }
+    this.persistTelemetryHistory();
+  }
+
+  public getTelemetryHistory(): TelemetryHistoryEntry[] {
+    return [...this.telemetryHistory];
+  }
+
+  public getDiagnosticExport(): TelemetryDiagnosticExport {
+    return {
+      format: 'autosense-diagnostic-v1',
+      exportedAt: new Date().toISOString(),
+      samples: this.getTelemetryHistory(),
+      communications: [...this.communicationHistory]
+    };
+  }
+
+  public clearDiagnosticHistory() {
+    this.telemetryHistory = [];
+    this.communicationHistory = [];
+    this.lastHistorySampleAt = 0;
+    this.persistTelemetryHistory(true);
+    this.appendLog('system', 'Historial de diagnóstico eliminado.');
   }
 
   public getTelemetry(): OBDTelemetry {
@@ -295,27 +462,24 @@ export class ELM327Service {
   }
 
   /**
-   * Extracts and stores supported PIDs returned by Mode 01 PID 00 / 20 / 40
+   * Extracts and stores one of the standard Mode 01 PID capability maps.
+   * A capability map is the ECU's own declaration; never manufacture a list
+   * of compatible sensors when that map was not actually received.
    */
   public parseSupportedPidsFromResponse(cmd: string, clean: string) {
-    if (cmd.includes('00')) {
-      const idx = clean.indexOf('4100');
-      if (idx !== -1 && clean.length >= idx + 12) {
-        const hex = clean.substring(idx + 4, idx + 12);
-        const pids = this.parseBitmaskSupportedPids(0, hex);
-        pids.forEach(p => this.supportedPidsSet.add(p));
-      } else {
-        ['0C', '0D', '05', '04', '11', '0B', '0E', '0F', 'ATRV'].forEach(p => this.supportedPidsSet.add(p));
-      }
-    } else if (cmd.includes('20')) {
-      const idx = clean.indexOf('4120');
-      if (idx !== -1 && clean.length >= idx + 12) {
-        const hex = clean.substring(idx + 4, idx + 12);
-        const pids = this.parseBitmaskSupportedPids(32, hex);
-        pids.forEach(p => this.supportedPidsSet.add(p));
-      }
-    }
-    this.supportedPidsSet.add('ATRV');
+    const normalizedCmd = cmd.replace(/\s+/g, '').toUpperCase();
+    const match = normalizedCmd.match(/^01([0-9A-F]{2})$/);
+    if (!match) return;
+
+    const mapPid = parseInt(match[1], 16);
+    if (mapPid % 0x20 !== 0) return;
+
+    const header = `41${match[1]}`;
+    const idx = clean.indexOf(header);
+    if (idx === -1 || clean.length < idx + 12) return;
+
+    const hex = clean.substring(idx + 4, idx + 12);
+    this.parseBitmaskSupportedPids(mapPid, hex).forEach(pid => this.supportedPidsSet.add(pid));
     this.updateSensorsTelemetry();
   }
 
@@ -355,7 +519,7 @@ export class ELM327Service {
 
   public pinAllSupportedSensors() {
     STANDARD_OBD_SENSORS.forEach(s => {
-      if (this.supportedPidsSet.has(s.pidHex) || s.pidHex === 'ATRV' || s.pidHex === '0C' || s.pidHex === '0D') {
+      if (this.isDisplayableSupportedSensor(s.pidHex)) {
         this.pinnedPids.add(s.pidHex);
       }
     });
@@ -363,6 +527,14 @@ export class ELM327Service {
     this.rebuildSecondaryPids();
     this.updateSensorsTelemetry();
     this.notify();
+  }
+
+  private isDisplayableSupportedSensor(pid: string): boolean {
+    if (pid === 'ATRV') return this.receivedPidsSet.has('ATRV');
+    if (!/^[0-9A-F]{2}$/.test(pid)) return false;
+    // 00, 20, 40... are capability-map metadata, not live measurements.
+    return parseInt(pid, 16) % 0x20 !== 0
+      && (this.supportedPidsSet.has(pid) || this.receivedPidsSet.has(pid));
   }
 
   public unpinAllSensors() {
@@ -386,7 +558,9 @@ export class ELM327Service {
    */
   public updateSensorsTelemetry() {
     const list: ECUSensorInfo[] = STANDARD_OBD_SENSORS.map(s => {
-      const isSupp = this.supportedPidsSet.has(s.pidHex);
+      const isSupp = this.isDisplayableSupportedSensor(s.pidHex);
+      const isManualFuel = s.pidHex === '2F' && this.currentTelemetry.fuelLevelSensorStatus === 'manual_calibrated';
+      const hasLiveValue = this.currentTelemetry.connectionState === 'simulated' || this.receivedPidsSet.has(s.pidHex);
       let isActive = false;
       let valStr = 'Sin dato';
       let numVal: number | null = null;
@@ -534,6 +708,16 @@ export class ELM327Service {
         valStr = this.currentTelemetry.coolantTemp < 40 ? 'ON (Calentando)' : 'OFF (Régimen)';
       }
 
+      // Being supported only means that the ECU advertises the PID. Until the
+      // corresponding frame is received, never present a calculated/default
+      // value as if it had come from the vehicle. Manual fuel calibration is
+      // kept visible and explicitly labelled as Manual.
+      if (!hasLiveValue && !isManualFuel) {
+        isActive = false;
+        valStr = isSupp ? 'Esperando lectura ECU' : 'Sin dato';
+        numVal = null;
+      }
+
       const fullPid = s.pidHex === 'ATRV' || s.pidHex.includes('_') || s.pidHex.startsWith('APP')
         ? s.pidHex
         : `01 ${s.pidHex}`;
@@ -592,6 +776,10 @@ export class ELM327Service {
    * Real Hardware Connection via Web Bluetooth API (ELM327 BLE)
    */
   public async connectRealBluetooth(): Promise<{ success: boolean; message: string }> {
+    if (Capacitor.isNativePlatform()) {
+      return this.connectNativeBluetooth();
+    }
+
     if (typeof navigator === 'undefined' || !(navigator as any).bluetooth) {
       return {
         success: false,
@@ -760,6 +948,161 @@ export class ELM327Service {
         message: err.message || 'No se pudo vincular con el adaptador ELM327.'
       };
     }
+  }
+
+  /**
+   * Android native connection. It first uses paired classic Bluetooth ELM327
+   * adapters (the usual inexpensive scanners) and falls back to BLE scanners.
+   */
+  private async connectNativeBluetooth(): Promise<{ success: boolean; message: string }> {
+    const obdServiceUuids = [
+      '0000fff0-0000-1000-8000-00805f9b34fb',
+      '0000ffe0-0000-1000-8000-00805f9b34fb',
+      '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+      '000018f0-0000-1000-8000-00805f9b34fb',
+      'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
+      '49535343-fe7d-4ae5-8fa9-9fafd205e455',
+      '0000fee7-0000-1000-8000-00805f9b34fb'
+    ];
+
+    try {
+      this.stopSimulation();
+      this.currentTelemetry.connectionState = 'connecting';
+      this.resetTelemetryToZero();
+      this.notify();
+      this.appendLog('system', 'Solicitando permiso de Bluetooth de Android...');
+
+      if (!this.nativeBluetoothInitialized) {
+        await BleClient.initialize({ androidNeverForLocation: true });
+        this.nativeBluetoothInitialized = true;
+      }
+
+      if (!(await BleClient.isEnabled())) {
+        await BleClient.requestEnable();
+      }
+
+      const classicDevice = await this.findPairedClassicObd();
+      if (classicDevice) {
+        await this.connectNativeClassic(classicDevice);
+        return { success: true, message: `Conectado a ${classicDevice.name || 'ELM327'} por Bluetooth` };
+      }
+
+      this.appendLog('system', 'No se encontró un ELM327 clásico emparejado. Buscando adaptador BLE...');
+      await BleClient.setDisplayStrings({
+        scanning: 'Buscando escáneres OBD...',
+        cancel: 'Cancelar',
+        availableDevices: 'Seleccioná tu ELM327',
+        noDeviceFound: 'No se encontraron dispositivos BLE'
+      });
+      const device = await BleClient.requestDevice({ optionalServices: obdServiceUuids });
+      await BleClient.connect(device.deviceId, () => {
+        this.appendLog('system', 'La conexión Bluetooth se perdió.');
+        this.disconnect();
+      });
+
+      const services = await BleClient.getServices(device.deviceId);
+      const selectedService = this.selectNativeBleService(services, obdServiceUuids);
+      if (!selectedService) {
+        await BleClient.disconnect(device.deviceId);
+        throw new Error('No se encontró el servicio serie del adaptador BLE.');
+      }
+
+      const channels = this.selectNativeBleChannels(selectedService);
+      if (!channels.tx || !channels.rx) {
+        await BleClient.disconnect(device.deviceId);
+        throw new Error('No se encontraron canales de lectura y escritura del adaptador BLE.');
+      }
+
+      this.nativeBleDeviceId = device.deviceId;
+      this.nativeBleServiceUuid = selectedService.uuid;
+      this.nativeBleTxCharacteristicUuid = channels.tx.uuid;
+      this.nativeBleRxCharacteristicUuid = channels.rx.uuid;
+      this.bluetoothDevice = { name: device.name || 'ELM327 BLE', deviceId: device.deviceId };
+
+      if (channels.rx.properties.notify || channels.rx.properties.indicate) {
+        await BleClient.startNotifications(
+          device.deviceId,
+          selectedService.uuid,
+          channels.rx.uuid,
+          (value) => this.handleIncomingRawChunk(new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)))
+        );
+      }
+
+      this.currentTelemetry.connectionState = 'connected';
+      this.notify();
+      this.appendLog('system', `ELM327 BLE conectado: ${device.name || device.deviceId}`);
+      await this.initELM327Protocol();
+      this.startRealOBDPollLoop();
+      return { success: true, message: `Conectado a ${device.name || 'ELM327 BLE'}` };
+    } catch (err: any) {
+      this.currentTelemetry.connectionState = 'disconnected';
+      this.notify();
+      const message = err?.message || String(err) || 'No se pudo conectar con el ELM327.';
+      this.appendLog('system', `Error Bluetooth Android: ${message}`);
+      return { success: false, message };
+    }
+  }
+
+  private async findPairedClassicObd(): Promise<ClassicBluetoothDevice | null> {
+    const serial = this.getClassicBluetoothSerial();
+    if (!serial) return null;
+
+    const devices = await new Promise<ClassicBluetoothDevice[]>((resolve, reject) => serial.list(resolve, reject));
+    const obdName = /(obd|elm|v-?link|viecar|konnwei|vgate|veepeak|icar|autoscan)/i;
+    return devices.find((device) => obdName.test(device.name || '')) || (devices.length === 1 ? devices[0] : null);
+  }
+
+  private async connectNativeClassic(device: ClassicBluetoothDevice): Promise<void> {
+    const serial = this.getClassicBluetoothSerial();
+    const address = device.address || device.id;
+    if (!serial || !address) throw new Error('Bluetooth clásico no está disponible en esta instalación.');
+
+    this.appendLog('system', `Conectando a ${device.name || address} por Bluetooth clásico...`);
+    await new Promise<void>((resolve, reject) => {
+      serial.connectInsecure(address, resolve, (error) => {
+        if (this.currentTelemetry.connectionState === 'connected') {
+          this.appendLog('system', 'La conexión Bluetooth clásica se perdió.');
+          this.disconnect();
+        } else {
+          reject(error);
+        }
+      });
+    });
+
+    serial.subscribeRawData(
+      (data) => {
+        if (typeof data === 'number') {
+          this.handleIncomingRawChunk(String.fromCharCode(data));
+        } else {
+          this.handleIncomingRawChunk(new TextDecoder().decode(new Uint8Array(data)));
+        }
+      },
+      (error) => this.appendLog('system', `Error de recepción Bluetooth: ${String(error)}`)
+    );
+
+    this.isNativeClassicConnection = true;
+    this.bluetoothDevice = { name: device.name || 'ELM327', address };
+    this.currentTelemetry.connectionState = 'connected';
+    this.notify();
+    await this.initELM327Protocol();
+    this.startRealOBDPollLoop();
+  }
+
+  private getClassicBluetoothSerial(): ClassicBluetoothSerial | null {
+    return (window as unknown as { bluetoothSerial?: ClassicBluetoothSerial }).bluetoothSerial || null;
+  }
+
+  private selectNativeBleService(services: BleService[], preferredUuids: string[]): BleService | null {
+    const normalized = new Set(preferredUuids.map((uuid) => uuid.toLowerCase()));
+    return services.find((service) => normalized.has(service.uuid.toLowerCase()))
+      || services.find((service) => service.characteristics.some((item) => item.properties.write || item.properties.writeWithoutResponse))
+      || null;
+  }
+
+  private selectNativeBleChannels(service: BleService): { tx: BleCharacteristic | null; rx: BleCharacteristic | null } {
+    const tx = service.characteristics.find((item) => item.properties.write || item.properties.writeWithoutResponse) || null;
+    const rx = service.characteristics.find((item) => item.properties.notify || item.properties.indicate) || tx;
+    return { tx, rx };
   }
 
   /**
@@ -1007,6 +1350,11 @@ export class ELM327Service {
    * Initializes the ELM327 chip and locks protocol with the vehicle's ECU
    */
   private async initELM327Protocol() {
+    // The adapter can be connected before the vehicle protocol is negotiated.
+    // Never let dashboard polling interleave with these setup commands.
+    this.isInitializingEcu = true;
+    this.ecuReadyForPolling = false;
+    this.currentTelemetry.isAutoPolling = false;
     this.appendLog('system', 'Configurando chip ELM327 (ATZ, ATE0, ATS0, ATH0, ATSP0)...');
     await this.sendATCommand('ATZ', 1000);   // Reset chip
     await this.delay(400);
@@ -1027,17 +1375,45 @@ export class ELM327Service {
     const voltResp = await this.sendATCommand('ATRV', 1500);
     this.parseBatteryVoltage(voltResp);
 
-    // CRITICAL: Send 0100 with 8-second timeout to negotiate and lock ECU protocol
-    this.appendLog('system', 'Negociando con la computadora del vehículo (0100)...');
+    // KWP/ISO adapters can take several seconds to finish their first protocol
+    // search. Do not make the user wake the ECU up from the Raw screen.
+    this.appendLog('system', 'Conectando automáticamente con la computadora del vehículo (puede demorar unos segundos)...');
     this.currentTelemetry.ecuStatus = 'searching';
     this.notify();
 
-    const ecuResp = await this.sendATCommand('0100', 8000);
-    const cleanEcu = ecuResp.replace(/\s+/g, '').toUpperCase();
+    let ecuResp = await this.sendATCommand('0100', 12_000);
+    let cleanEcu = ecuResp.replace(/\s+/g, '').toUpperCase();
 
-    if (cleanEcu.includes('4100')) {
+    // This vehicle has already identified itself as ISO 14230-4 KWP Fast in a
+    // successful session. If automatic search does not complete, try that
+    // protocol ourselves before reporting a failure. This replaces the former
+    // manual Raw-screen workaround (ATSP0 / individual blue buttons).
+    if (!cleanEcu.includes('4100') && !cleanEcu.includes('NODATA')) {
+      this.appendLog('system', 'La búsqueda automática no terminó. Probando KWP rápido en forma automática...');
+      await this.sendATCommand('ATSP5', 1_500);
+      await this.delay(500);
+      ecuResp = await this.sendATCommand('0100', 12_000);
+      cleanEcu = ecuResp.replace(/\s+/g, '').toUpperCase();
+    }
+
+    // Some KWP ECUs answer their live PIDs correctly but take too long or
+    // reject the capability bitmap during startup. A genuine RPM frame is
+    // sufficient proof that the ECU link works; do not force the user to
+    // press the Raw RPM button to unlock the live dashboard.
+    let liveProbeResponse = '';
+    if (!cleanEcu.includes('4100') && !cleanEcu.includes('NODATA')) {
+      this.appendLog('system', 'Verificando RPM automáticamente para confirmar el enlace...');
+      liveProbeResponse = await this.sendATCommand('01 0C', 8_000);
+    }
+    const hasEcuBitmap = cleanEcu.includes('4100');
+    const hasLiveRpm = liveProbeResponse.replace(/\s+/g, '').toUpperCase().includes('410C');
+
+    if (hasEcuBitmap || hasLiveRpm) {
       this.currentTelemetry.ecuStatus = 'connected';
-      this.appendLog('system', '¡Computadora (ECU) del auto respondió con éxito!');
+      this.ecuReadyForPolling = true;
+      this.appendLog('system', hasEcuBitmap
+        ? '¡Computadora (ECU) del auto respondió con éxito!'
+        : '¡La ECU respondió RPM! Se inicia la vista en vivo aunque no informó su lista de sensores.');
 
       // Read human-readable protocol description (ATDP)
       const protoResp = await this.sendATCommand('ATDP', 2000);
@@ -1046,19 +1422,14 @@ export class ELM327Service {
         this.appendLog('system', `Protocolo detectado: ${protoResp.trim()}`);
       }
 
-      // Parse Supported PIDs bitmask (Mode 01 PID 00)
-      this.parseSupportedPidsFromResponse('0100', cleanEcu);
+      // Ask every capability map that this ECU itself links (0100, 0120,
+      // 0140...). This is quick and read-only, and avoids showing catalogue
+      // entries that the vehicle did not declare.
+      if (hasEcuBitmap) await this.scanAdvertisedStandardPids(cleanEcu);
 
-      // If bit 32 (PID 20) is supported, query 01 20 to discover PIDs 21-40
-      if (this.supportedPidsSet.has('20')) {
-        this.appendLog('system', 'Consultando sensores rango 21-40 (01 20)...');
-        const resp20 = await this.sendATCommand('01 20', 2500);
-        const clean20 = resp20.replace(/\s+/g, '').toUpperCase();
-        this.parseSupportedPidsFromResponse('0120', clean20);
-      }
-
-      // Check specifically if PID 2F (Fuel Level) is supported by the ECU
-      if (!this.supportedPidsSet.has('2F')) {
+      // Check fuel support only when the ECU actually returned its PID map.
+      // With an RPM-only handshake the map is unknown, not unsupported.
+      if (hasEcuBitmap && !this.supportedPidsSet.has('2F')) {
         if (this.currentTelemetry.fuelLevelSensorStatus !== 'manual_calibrated') {
           this.currentTelemetry.fuelLevelSensorStatus = 'unsupported_by_ecu';
           this.currentTelemetry.fuelLevelPercent = null;
@@ -1067,15 +1438,23 @@ export class ELM327Service {
       }
 
       this.updateSensorsTelemetry();
-      this.appendLog('system', `📊 Sensores detectados en la ECU: ${this.currentTelemetry.supportedSensorsCount} compatibles.`);
+      // The first visit starts with the exact sensors detected for this ECU;
+      // the user can still remove any card afterwards from the selector.
+      this.pinAllSupportedSensors();
+      this.appendLog('system', hasEcuBitmap
+        ? `📊 Sensores detectados en la ECU: ${this.currentTelemetry.supportedSensorsCount} compatibles.`
+        : '📊 Enlace confirmado por RPM. La app irá detectando los demás sensores mientras lee.');
     } else if (cleanEcu.includes('NODATA') || ecuResp.includes('NO DATA')) {
       this.currentTelemetry.ecuStatus = 'no_data';
+      this.ecuReadyForPolling = false;
       this.appendLog('system', 'Aviso: La ECU respondió NO DATA. (Verificá llave en CONTACTO o motor encendido).');
     } else {
       this.currentTelemetry.ecuStatus = 'error';
-      this.appendLog('system', `Respuesta ECU: ${ecuResp || 'Sin respuesta'}. Probá forzar protocolo KWP2000.`);
+      this.ecuReadyForPolling = false;
+      this.appendLog('system', `La ECU no confirmó el enlace: ${ecuResp || 'Sin respuesta'}. La vista en vivo queda detenida para no mostrar datos dudosos.`);
     }
 
+    this.isInitializingEcu = false;
     this.notify();
   }
 
@@ -1085,6 +1464,10 @@ export class ELM327Service {
    */
   public async setProtocol(protoCmd: string): Promise<string> {
     this.appendLog('system', `Cambiando protocolo de comunicación a ${protoCmd}...`);
+    this.isPollingActive = false;
+    this.isInitializingEcu = true;
+    this.ecuReadyForPolling = false;
+    this.currentTelemetry.isAutoPolling = false;
     this.currentTelemetry.ecuStatus = 'searching';
     this.resetSensorFailures();
     this.notify();
@@ -1095,34 +1478,63 @@ export class ELM327Service {
 
     // Test communication with Mode 01 PID 00
     this.appendLog('system', `Verificando enlace con ECU bajo ${protoCmd} (0100)...`);
-    const resp = await this.sendATCommand('0100', 7000);
+    const resp = await this.sendATCommand('0100', 12_000);
     const clean = resp.replace(/\s+/g, '').toUpperCase();
 
     if (clean.includes('4100')) {
       this.currentTelemetry.ecuStatus = 'connected';
+      this.ecuReadyForPolling = true;
       const dp = await this.sendATCommand('ATDP', 2000);
       this.currentTelemetry.ecuProtocolDetected = dp.trim();
       this.appendLog('system', `¡Enlace exitoso con ECU bajo ${protoCmd}! Protocolo: ${dp.trim()}`);
 
-      this.parseSupportedPidsFromResponse('0100', clean);
-      if (this.supportedPidsSet.has('20')) {
-        const resp20 = await this.sendATCommand('01 20', 2500);
-        this.parseSupportedPidsFromResponse('0120', resp20.replace(/\s+/g, '').toUpperCase());
-      }
+      await this.scanAdvertisedStandardPids(clean);
       if (!this.supportedPidsSet.has('2F') && this.currentTelemetry.fuelLevelSensorStatus !== 'manual_calibrated') {
         this.currentTelemetry.fuelLevelSensorStatus = 'unsupported_by_ecu';
         this.currentTelemetry.fuelLevelPercent = null;
       }
       this.updateSensorsTelemetry();
+      this.pinAllSupportedSensors();
       this.appendLog('system', `📊 Sensores detectados en la ECU: ${this.currentTelemetry.supportedSensorsCount} compatibles.`);
     } else {
       this.currentTelemetry.ecuStatus = 'no_data';
+      this.ecuReadyForPolling = false;
       this.appendLog('system', `ECU no respondió en ${protoCmd}: ${resp}`);
     }
 
+    this.isInitializingEcu = false;
     this.ensurePollingActive();
     this.notify();
     return resp;
+  }
+
+  /** Reads the full chain of standard 32-PID capability maps declared by ECU. */
+  private async scanAdvertisedStandardPids(initialCleanResponse: string) {
+    let mapPid = 0x00;
+    let clean = initialCleanResponse;
+
+    for (let mapsRead = 0; mapsRead < 8; mapsRead++) {
+      const mapHex = mapPid.toString(16).toUpperCase().padStart(2, '0');
+      const header = `41${mapHex}`;
+      const responseIndex = clean.indexOf(header);
+      if (responseIndex === -1 || clean.length < responseIndex + 12) break;
+
+      const advertised = this.parseBitmaskSupportedPids(
+        mapPid,
+        clean.substring(responseIndex + 4, responseIndex + 12)
+      );
+      advertised.forEach(pid => this.supportedPidsSet.add(pid));
+
+      const nextMapPid = (mapPid + 0x20).toString(16).toUpperCase().padStart(2, '0');
+      if (!advertised.has(nextMapPid)) break;
+
+      mapPid += 0x20;
+      this.appendLog('system', `Detectando sensores estándar rango ${mapPid + 1}-${mapPid + 0x20}...`);
+      const response = await this.sendATCommand(`01 ${nextMapPid}`, 4_000);
+      clean = response.replace(/\s+/g, '').toUpperCase();
+    }
+
+    this.updateSensorsTelemetry();
   }
 
   /**
@@ -1139,15 +1551,19 @@ export class ELM327Service {
   }
 
   public isAutoPolling(): boolean {
-    return this.isPollingActive && !this.autoPollPaused;
+    return this.isPollingActive && this.ecuReadyForPolling && !this.autoPollPaused;
   }
 
   public setAutoPollPaused(paused: boolean) {
     this.autoPollPaused = paused;
-    this.currentTelemetry.isAutoPolling = !paused;
-    this.appendLog('system', paused ? 'Lectura continua automática en pausa.' : 'Lectura continua automática reanudada.');
+    this.currentTelemetry.isAutoPolling = !paused && this.ecuReadyForPolling;
+    this.appendLog('system', paused
+      ? 'Lectura continua automática en pausa.'
+      : this.ecuReadyForPolling
+      ? 'Lectura continua automática reanudada.'
+      : 'Lectura automática pendiente: la ECU todavía no confirmó el enlace.');
     this.notify();
-    if (!paused && !this.isPollingActive && this.currentTelemetry.connectionState === 'connected') {
+    if (!paused && !this.isPollingActive && this.ecuReadyForPolling && this.currentTelemetry.connectionState === 'connected') {
       this.startRealOBDPollLoop();
     }
   }
@@ -1161,6 +1577,7 @@ export class ELM327Service {
   public resetSensorFailures() {
     this.pidFailCounts = {};
     this.nextSecondaryIdx = 0;
+    this.nextPrioritySensorIdx = 0;
   }
 
   public getAutoPollCount(): number {
@@ -1194,8 +1611,179 @@ export class ELM327Service {
    * Immediately triggers a single RPM query on demand and returns the parsed RPM
    */
   public async pollRPMNow(): Promise<number> {
-    await this.sendATCommand('01 0C', 2000);
+    await this.pollSensorNow('0C');
     return this.currentTelemetry.rpm;
+  }
+
+  /**
+   * Requests one standard sensor immediately. It still goes through the same
+   * serialized ELM327 queue as automatic polling, so a tap in Live can never
+   * mix this sensor's answer with another pending command.
+   */
+  public async pollSensorNow(pid: string): Promise<string> {
+    const normalized = pid.replace(/^01\s*/i, '').trim().toUpperCase();
+    const isStandardPid = /^[0-9A-F]{2}$/.test(normalized);
+    if (!isStandardPid && normalized !== 'ATRV') {
+      throw new Error('Este sensor no se puede consultar con un comando OBD estándar.');
+    }
+
+    const command = normalized === 'ATRV' ? 'ATRV' : `01 ${normalized}`;
+    const response = await this.sendATCommand(command, normalized === 'ATRV' ? 2_000 : 4_000);
+    this.recalculateDerivedTelemetry();
+    this.updateSensorsTelemetry();
+    this.currentTelemetry.lastUpdated = new Date().toISOString();
+    this.notify();
+    return response;
+  }
+
+  /**
+   * Performs a read-only inventory of the standard Mode 01 PIDs available on
+   * this ECU. It follows the ECU's own 0100/0120/... bitmaps first, then adds
+   * a small set of useful probes (including oil temperature 015C) because
+   * inexpensive ELM327 clones sometimes advertise an incomplete bitmap.
+   */
+  public async runStandardPidDiscovery(
+    onProgress?: (completed: number, total: number, label: string) => void
+  ): Promise<StandardPidDiscoveryReport> {
+    if (this.currentTelemetry.connectionState !== 'connected' || !this.ecuReadyForPolling) {
+      throw new Error('La ECU no confirmó el enlace. Esperá una respuesta real antes de iniciar el inventario.');
+    }
+
+    const wasPaused = this.autoPollPaused;
+    const startedAt = new Date().toISOString();
+    const advertised = new Set<string>();
+    const readings: StandardPidDiscoveryReading[] = [];
+    this.setAutoPollPaused(true);
+    this.appendLog('system', 'Iniciando inventario seguro de PIDs estándar de la ECU...');
+
+    try {
+      // The continuation bit in each 32-PID map indicates the next map.
+      let rangePid = 0x00;
+      for (let mapsRead = 0; mapsRead < 8; mapsRead++) {
+        const pidHex = rangePid.toString(16).toUpperCase().padStart(2, '0');
+        const response = await this.sendATCommand(`01 ${pidHex}`, 6_000);
+        const clean = response.replace(/\s+/g, '').toUpperCase();
+        const header = `41${pidHex}`;
+        const responseIndex = clean.indexOf(header);
+        if (responseIndex === -1 || clean.length < responseIndex + 12) break;
+
+        const map = this.parseBitmaskSupportedPids(rangePid, clean.substring(responseIndex + 4, responseIndex + 12));
+        map.forEach((pid) => advertised.add(pid));
+        map.forEach((pid) => this.supportedPidsSet.add(pid));
+        const nextMapPid = (rangePid + 0x20).toString(16).toUpperCase().padStart(2, '0');
+        if (!map.has(nextMapPid)) break;
+        rangePid += 0x20;
+      }
+
+      // Range-map PIDs (00, 20, 40...) are metadata rather than measurements.
+      const isRangeMap = (pid: string) => parseInt(pid, 16) % 0x20 === 0;
+      const extraProbes = ['0C', '0D', '05', '04', '11', '0B', '10', '0F', '0E', '5C', '33', '46', '23', '42', '0A', '1F'];
+      const pidsToRead = Array.from(new Set([
+        ...Array.from(advertised).filter((pid) => !isRangeMap(pid)),
+        ...extraProbes
+      ])).sort((a, b) => parseInt(a, 16) - parseInt(b, 16));
+
+      let completed = 0;
+      for (const pid of pidsToRead) {
+        const response = await this.sendATCommand(`01 ${pid}`, 4_000);
+        const normalized = response.replace(/\s+/g, '').toUpperCase();
+        const result: StandardPidDiscoveryReading['result'] = normalized.includes(`41${pid}`)
+          ? 'datos'
+          : normalized.includes('NODATA') || normalized.includes('7F')
+          ? 'sin_datos'
+          : 'sin_respuesta';
+        readings.push({
+          pid,
+          command: `01 ${pid}`,
+          source: advertised.has(pid) ? 'anunciado_por_ecu' : 'prueba_extra',
+          response,
+          result,
+          timestamp: new Date().toISOString()
+        });
+        completed++;
+        onProgress?.(completed, pidsToRead.length, `PID 01 ${pid}`);
+        await this.delay(50);
+      }
+
+      this.updateSensorsTelemetry();
+      const withData = readings.filter((reading) => reading.result === 'datos').length;
+      this.appendLog('system', `Inventario terminado: ${withData}/${readings.length} PIDs devolvieron datos reales.`);
+      return {
+        format: 'autosense-standard-pid-discovery-v1',
+        startedAt,
+        completedAt: new Date().toISOString(),
+        advertisedPids: Array.from(advertised).sort((a, b) => parseInt(a, 16) - parseInt(b, 16)),
+        readings
+      };
+    } finally {
+      if (!wasPaused) this.setAutoPollPaused(false);
+    }
+  }
+
+  /**
+   * Runs a deterministic hardware check of the most useful driving sensors.
+   * The automatic stream is paused during the check so every TX/RX pair in
+   * the resulting report belongs to this circuit and can be compared easily.
+   */
+  public async runSensorTestCircuit(
+    rounds: number = 2,
+    onProgress?: (completed: number, total: number, label: string) => void
+  ): Promise<SensorTestCircuitReport> {
+    if (this.currentTelemetry.connectionState !== 'connected' || !this.ecuReadyForPolling) {
+      throw new Error('La ECU no confirmó el enlace. Esperá una respuesta 4100 antes de iniciar la prueba.');
+    }
+
+    const sensors = [
+      { label: 'RPM', command: '01 0C' },
+      { label: 'Velocidad', command: '01 0D' },
+      { label: 'Temperatura refrigerante', command: '01 05' },
+      { label: 'Carga de motor', command: '01 04' },
+      { label: 'Acelerador', command: '01 11' },
+      { label: 'Presión MAP', command: '01 0B' },
+      { label: 'Caudal MAF', command: '01 10' },
+      { label: 'Temperatura de admisión', command: '01 0F' },
+      { label: 'Avance de encendido', command: '01 0E' },
+      { label: 'Voltaje del adaptador', command: 'ATRV' }
+    ];
+    const safeRounds = Math.max(1, Math.min(5, Math.floor(rounds)));
+    const total = sensors.length * safeRounds;
+    const startedAt = new Date().toISOString();
+    const readings: SensorTestCircuitReading[] = [];
+    const wasPaused = this.autoPollPaused;
+
+    this.setAutoPollPaused(true);
+    this.appendLog('system', `Iniciando prueba de sensores: ${sensors.length} sensores × ${safeRounds} vueltas.`);
+
+    try {
+      let completed = 0;
+      for (let round = 1; round <= safeRounds; round++) {
+        for (const sensor of sensors) {
+          const response = await this.sendATCommand(sensor.command, 2_000);
+          completed++;
+          readings.push({
+            round,
+            label: sensor.label,
+            command: sensor.command,
+            response,
+            timestamp: new Date().toISOString()
+          });
+          onProgress?.(completed, total, sensor.label);
+          await this.delay(80);
+        }
+      }
+    } finally {
+      if (!wasPaused) this.setAutoPollPaused(false);
+    }
+
+    const report: SensorTestCircuitReport = {
+      format: 'autosense-sensor-circuit-v1',
+      startedAt,
+      completedAt: new Date().toISOString(),
+      rounds: safeRounds,
+      readings
+    };
+    this.appendLog('system', `Prueba finalizada: ${readings.length} respuestas registradas.`);
+    return report;
   }
 
   /**
@@ -1203,8 +1791,8 @@ export class ELM327Service {
    */
   public ensurePollingActive() {
     this.autoPollPaused = false;
-    this.currentTelemetry.isAutoPolling = true;
-    if (this.currentTelemetry.connectionState === 'connected' && !this.isPollingActive) {
+    this.currentTelemetry.isAutoPolling = this.ecuReadyForPolling;
+    if (this.currentTelemetry.connectionState === 'connected' && this.ecuReadyForPolling && !this.isInitializingEcu && !this.isPollingActive) {
       this.startRealOBDPollLoop();
     }
   }
@@ -1225,9 +1813,13 @@ export class ELM327Service {
       response = await this.transmitToHardware(cleanCmd, timeoutMs);
       this.currentTelemetry.lastRawResponse = response || '(sin datos)';
       this.appendLog('rx', response || '(sin datos)');
-    } else {
-      // If in pure simulation mode, emulate response
+    } else if (this.currentTelemetry.connectionState === 'simulated') {
+      // Simulation is opt-in only. It is never used as a fallback for a failed
+      // Bluetooth connection or while the app is disconnected.
       response = this.simulateCommandResponse(cleanCmd);
+    } else {
+      response = 'ERR_NOT_CONNECTED';
+      this.appendLog('system', 'Comando no enviado: no hay un ELM327 conectado.');
     }
 
     // CRITICAL: Always parse the response of the command immediately!
@@ -1238,11 +1830,16 @@ export class ELM327Service {
   }
 
   private async transmitToHardware(cmd: string, timeoutMs: number): Promise<string> {
-    let waitCount = 0;
-    while (this.isBusySending && waitCount < 30) {
-      await this.delay(35);
-      waitCount++;
-    }
+    let releaseQueue: () => void = () => undefined;
+    const previousCommand = this.commandQueue;
+    this.commandQueue = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+
+    // Do not overwrite rxResolver while another command still owns the ELM327
+    // response prompt. This was most noticeable when using Raw view while the
+    // automatic stream was active.
+    await previousCommand;
     this.isBusySending = true;
 
     try {
@@ -1253,9 +1850,12 @@ export class ELM327Service {
 
       // Prepare promise waiting for '>' prompt character from ELM327
       const responsePromise = new Promise<string>((resolve) => {
-        this.rxResolver = resolve;
+        const resolver = (response: string) => resolve(response);
+        this.rxResolver = resolver;
         setTimeout(() => {
-          if (this.rxResolver) {
+          // A timeout from an earlier command must never cancel the command
+          // that is currently waiting for its own ELM327 prompt.
+          if (this.rxResolver === resolver) {
             const res = this.rxBuffer.trim();
             this.rxResolver = null;
             resolve(res || 'TIMEOUT');
@@ -1265,15 +1865,31 @@ export class ELM327Service {
 
       const payload = new TextEncoder().encode(cmd + '\r');
 
-      // 1. Transmit via BLE (prefer writeWithoutResponse for fast clones)
-      if (this.txCharacteristic) {
+      // 1. Transmit via Android native Bluetooth Classic.
+      if (this.isNativeClassicConnection) {
+        const serial = this.getClassicBluetoothSerial();
+        if (!serial) return 'ERR_NO_CHANNEL';
+        await new Promise<void>((resolve, reject) => serial.write(cmd + '\r', resolve, reject));
+      }
+      // 2. Transmit via Android native BLE.
+      else if (this.nativeBleDeviceId && this.nativeBleServiceUuid && this.nativeBleTxCharacteristicUuid) {
+        const value = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        await BleClient.writeWithoutResponse(
+          this.nativeBleDeviceId,
+          this.nativeBleServiceUuid,
+          this.nativeBleTxCharacteristicUuid,
+          value
+        );
+      }
+      // 3. Transmit via Web Bluetooth (browser).
+      else if (this.txCharacteristic) {
         if (this.txCharacteristic.properties.writeWithoutResponse) {
           await this.txCharacteristic.writeValueWithoutResponse(payload);
         } else if (this.txCharacteristic.properties.write) {
           await this.txCharacteristic.writeValueWithResponse(payload);
         }
       }
-      // 2. Transmit via Web Serial (Notebook COM port)
+      // 4. Transmit via Web Serial (Notebook COM port)
       else if (this.serialWriter) {
         await this.serialWriter.write(payload);
       } else {
@@ -1287,6 +1903,7 @@ export class ELM327Service {
       return `ERR: ${err.message}`;
     } finally {
       this.isBusySending = false;
+      releaseQueue();
     }
   }
 
@@ -1299,12 +1916,39 @@ export class ELM327Service {
       .trim();
   }
 
+  private canPollPid(pid: string): boolean {
+    const cleanPid = pid.replace('01 ', '').trim().toUpperCase();
+    // Several inexpensive ELM327 clones return an incomplete 0100 bitmask
+    // even though they answer these standard live PIDs. Keep trying the core
+    // driving readings; repeated NO DATA responses are still throttled below.
+    const coreLivePids = new Set(['0C', '0D', '04', '11', '0B', '10']);
+    return cleanPid === 'ATRV' || coreLivePids.has(cleanPid) || this.supportedPidsSet.size === 0 || this.supportedPidsSet.has(cleanPid);
+  }
+
+  private async pollSecondaryPid(sensor: { pid: string; timeout: number }) {
+    if (!this.canPollPid(sensor.pid)) return;
+    const failCount = this.pidFailCounts[sensor.pid] || 0;
+    if (failCount >= 5) return;
+
+    const response = await this.sendATCommand(sensor.pid, sensor.timeout);
+    const normalized = response.replace(/\s+/g, '').toUpperCase();
+    if (normalized.includes('NODATA') || normalized.includes('TIMEOUT') || normalized.includes('7F')) {
+      this.pidFailCounts[sensor.pid] = failCount + 1;
+      if (sensor.pid === '01 2F' && this.currentTelemetry.fuelLevelSensorStatus !== 'manual_calibrated') {
+        this.currentTelemetry.fuelLevelSensorStatus = 'unsupported_by_ecu';
+        this.currentTelemetry.fuelLevelPercent = null;
+      }
+    } else if (normalized.includes('41') || normalized.includes('V')) {
+      this.pidFailCounts[sensor.pid] = 0;
+    }
+  }
+
   /**
    * Continuous Real-time OBD Polling Loop (Queries real vehicle ECU sensors repeatedly)
    * Runs 100% automatically in the background without needing any clicks from the user!
    */
   private async startRealOBDPollLoop() {
-    if (this.isPollingActive) return;
+    if (this.isPollingActive || this.isInitializingEcu || !this.ecuReadyForPolling) return;
     this.isPollingActive = true;
     this.currentTelemetry.isAutoPolling = true;
     this.autoPollPaused = false;
@@ -1324,39 +1968,56 @@ export class ELM327Service {
       this.currentTelemetry.isAutoPolling = true;
 
       try {
-        // PASO 1: SIEMPRE CONSULTAR RPM (01 0C) para respuesta inmediata del tacómetro
-        await this.sendATCommand('01 0C', 1600);
+        // Fast tier: RPM is always first. One ELM327 can only process one
+        // request at a time, so each command waits for its own reply/prompt
+        // before the next one is transmitted.
+        await this.sendATCommand('01 0C', 4_000);
 
         if (this.pollMode === 'all') {
-          // PASO 2: INTERCALAR SENSORES SECUNDARIOS EN ROUND-ROBIN
-          await this.delay(50);
+          await this.delay(25);
 
-          // Cada 12 ciclos le damos una nueva oportunidad a cualquier sensor que haya respondido NO DATA
-          if (cycle % 12 === 0) {
-            this.pidFailCounts = {};
+          // Fast tier: speed alternates with the engine-air readings. This
+          // keeps the two driving gauges responsive without flooding a slow
+          // KWP adapter with parallel requests.
+          if (cycle % 2 === 0) {
+            await this.pollSecondaryPid({ pid: '01 0D', timeout: 4_000 });
+          } else {
+            // Medium tier: changes while driving, but not on every RPM frame.
+            const mediumSensors = [
+              { pid: '01 04', timeout: 4_000 },
+              { pid: '01 11', timeout: 4_000 },
+              { pid: '01 10', timeout: 4_000 },
+              { pid: '01 0B', timeout: 4_000 }
+            ];
+            const medium = mediumSensors[this.nextPrioritySensorIdx % mediumSensors.length];
+            this.nextPrioritySensorIdx++;
+            await this.pollSecondaryPid(medium);
           }
 
-          // Seleccionar próximo sensor secundario de la lista
-          const sensor = this.secondaryPids[this.nextSecondaryIdx % this.secondaryPids.length];
-          this.nextSecondaryIdx++;
-
-          const failCount = this.pidFailCounts[sensor.pid] || 0;
-          if (failCount < 5) {
-            const resp = await this.sendATCommand(sensor.pid, sensor.timeout);
-            if (resp.includes('NO DATA') || resp.includes('NODATA') || resp === 'TIMEOUT') {
-              this.pidFailCounts[sensor.pid] = failCount + 1;
-              if (sensor.pid === '01 2F') {
-                if (this.currentTelemetry.fuelLevelSensorStatus !== 'manual_calibrated') {
-                  this.currentTelemetry.fuelLevelSensorStatus = 'unsupported_by_ecu';
-                  this.currentTelemetry.fuelLevelPercent = null;
-                }
-              }
-            } else if (resp.includes('41') || resp.includes('V')) {
-              this.pidFailCounts[sensor.pid] = 0;
+          // Slow tier: temperature, voltage, trims and fuel-related values
+          // do not need to occupy every live-reading cycle.
+          if (cycle % 12 === 0) {
+            await this.delay(25);
+            const fastOrMedium = new Set(['01 0D', '01 04', '01 11', '01 10', '01 0B']);
+            const slowSensors = this.secondaryPids
+              .filter((sensor) => !fastOrMedium.has(sensor.pid))
+              .map((sensor) => ({
+                pid: sensor.pid,
+                timeout: sensor.pid === 'ATRV' ? 2_000 : 4_000
+              }));
+            if (slowSensors.length > 0) {
+              const sensor = slowSensors[this.nextSecondaryIdx % slowSensors.length];
+              this.nextSecondaryIdx++;
+              await this.pollSecondaryPid(sensor);
             }
           }
 
-          await this.delay(50);
+          // Retry a rejected PID only after a while; repeatedly querying an
+          // unsupported ECU item slows down every sensor that does work.
+          if (cycle % 30 === 0) {
+            this.pidFailCounts = {};
+          }
+          await this.delay(25);
         } else {
           // Modo solo RPM: cada 8 ciclos refrescar voltaje de batería
           if (cycle % 8 === 0) {
@@ -1367,6 +2028,7 @@ export class ELM327Service {
         }
 
         this.recalculateDerivedTelemetry();
+        this.captureTelemetryHistory();
         this.currentTelemetry.lastUpdated = new Date().toISOString();
         this.notify();
       } catch (pollErr) {
@@ -1398,6 +2060,8 @@ export class ELM327Service {
       this.currentTelemetry.ecuStatus = 'error';
       return;
     }
+
+    this.markPidAsReceived(cmd, raw);
 
     // 1. RPM (Mode 01 PID 0C) -> "41 0C A B"
     const rpmMatch = raw.match(/(?:41\s*0C|410C)\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})/);
@@ -1622,33 +2286,29 @@ export class ELM327Service {
   }
 
   private recalculateDerivedTelemetry() {
-    const rpm = this.currentTelemetry.rpm;
     const speed = this.currentTelemetry.speed;
-    const load = this.currentTelemetry.engineLoad || 22;
 
-    // Fuel Consumption calculation
+    // Consumption is derived only from an actual MAF reading. Do not invent an
+    // engine-based estimate when the ECU does not provide airflow data.
     if (this.currentTelemetry.mafRate && this.currentTelemetry.mafRate > 0) {
       const litersPerHour = (this.currentTelemetry.mafRate * 3600) / (14.5 * 840);
       if (speed > 5) {
         this.currentTelemetry.instantConsumptionL100km = Math.round(((litersPerHour / speed) * 100) * 10) / 10;
+        this.currentTelemetry.avgConsumptionL100km = this.currentTelemetry.avgConsumptionL100km > 0
+          ? Math.round((this.currentTelemetry.avgConsumptionL100km * 0.9 + this.currentTelemetry.instantConsumptionL100km * 0.1) * 10) / 10
+          : this.currentTelemetry.instantConsumptionL100km;
       } else {
         this.currentTelemetry.instantConsumptionL100km = Math.round(litersPerHour * 10) / 10;
       }
-    } else if (rpm > 0) {
-      // Estimated for 2.8L turbo diesel engine:
-      const estLitersPerHour = Math.max(0.7, (rpm / 1000) * (load / 100) * 2.8 * 0.75);
-      if (speed > 5) {
-        this.currentTelemetry.instantConsumptionL100km = Math.max(3.8, Math.min(24, Math.round(((estLitersPerHour / speed) * 100) * 10) / 10));
-      } else {
-        this.currentTelemetry.instantConsumptionL100km = Math.round(estLitersPerHour * 10) / 10;
-      }
+    } else {
+      this.currentTelemetry.instantConsumptionL100km = 0;
     }
 
-    // Range calculation based on fuel level and 75L tank
-    if (this.currentTelemetry.fuelLevelPercent !== null && this.currentTelemetry.fuelLevelPercent > 0) {
+    // Range is only shown once there is a real consumption average. The fuel
+    // figure may be ECU-provided or an explicitly labelled manual calibration.
+    if (this.currentTelemetry.fuelLevelPercent !== null && this.currentTelemetry.fuelLevelPercent > 0 && this.currentTelemetry.avgConsumptionL100km > 0) {
       const litersInTank = (this.currentTelemetry.fuelLevelPercent / 100) * 75;
-      const avgCons = this.currentTelemetry.avgConsumptionL100km || 9.2;
-      this.currentTelemetry.rangeKmRemaining = Math.round((litersInTank / avgCons) * 100);
+      this.currentTelemetry.rangeKmRemaining = Math.round((litersInTank / this.currentTelemetry.avgConsumptionL100km) * 100);
     } else {
       this.currentTelemetry.rangeKmRemaining = 0;
     }
@@ -1747,6 +2407,25 @@ export class ELM327Service {
   public disconnect() {
     this.isPollingActive = false;
 
+    if (this.nativeBleDeviceId) {
+      const deviceId = this.nativeBleDeviceId;
+      if (this.nativeBleServiceUuid && this.nativeBleRxCharacteristicUuid) {
+        BleClient.stopNotifications(deviceId, this.nativeBleServiceUuid, this.nativeBleRxCharacteristicUuid).catch(() => undefined);
+      }
+      BleClient.disconnect(deviceId).catch(() => undefined);
+    }
+    this.nativeBleDeviceId = null;
+    this.nativeBleServiceUuid = null;
+    this.nativeBleTxCharacteristicUuid = null;
+    this.nativeBleRxCharacteristicUuid = null;
+
+    if (this.isNativeClassicConnection) {
+      const serial = this.getClassicBluetoothSerial();
+      serial?.unsubscribeRawData?.(() => undefined, () => undefined);
+      serial?.disconnect?.(() => undefined, () => undefined);
+    }
+    this.isNativeClassicConnection = false;
+
     if (this.gattServer && this.gattServer.connected) {
       try { this.gattServer.disconnect(); } catch (_) {}
     }
@@ -1775,6 +2454,13 @@ export class ELM327Service {
     this.currentTelemetry.engineLoad = 0;
     this.currentTelemetry.throttlePos = 0;
     this.currentTelemetry.coolantTemp = 0;
+    this.currentTelemetry.intakeAirTemp = 0;
+    this.currentTelemetry.mafRate = 0;
+    this.currentTelemetry.batteryVoltage = 0;
+    this.currentTelemetry.intakePressureMap = 0;
+    this.currentTelemetry.timingAdvance = 0;
+    this.currentTelemetry.shortTermFuelTrim = 0;
+    this.currentTelemetry.longTermFuelTrim = 0;
     const savedFuel = this.getInitialFuelLevel();
     if (savedFuel !== null) {
       this.currentTelemetry.fuelLevelPercent = savedFuel;
@@ -1793,8 +2479,39 @@ export class ELM327Service {
     this.currentTelemetry.lastCommandSent = '';
     this.activeDtcs = [];
     this.currentTelemetry.activeDtcsCount = 0;
+    this.currentTelemetry.oilTemp = undefined;
+    this.currentTelemetry.oilPressureKpa = undefined;
+    this.currentTelemetry.transmissionTemp = undefined;
+    this.currentTelemetry.totalMisfires = 0;
+    this.currentTelemetry.ambientTemp = undefined;
+    this.currentTelemetry.fuelPressureKpa = undefined;
+    this.currentTelemetry.barometricPressureKpa = undefined;
+    this.currentTelemetry.engineRunTimeSec = undefined;
+    this.currentTelemetry.controlModuleVoltage = undefined;
+    this.currentTelemetry.distanceWithMilKm = undefined;
+    this.currentTelemetry.distanceSinceDtcClearedKm = undefined;
+    this.currentTelemetry.fuelRailPressureDieselKpa = undefined;
+    this.currentTelemetry.freezeFrame = undefined;
     this.supportedPidsSet.clear();
+    this.receivedPidsSet.clear();
     this.updateSensorsTelemetry();
+  }
+
+  private markPidAsReceived(cmd: string, raw: string) {
+    if (this.currentTelemetry.connectionState !== 'connected') return;
+
+    const normalizedCommand = cmd.replace(/\s+/g, '').toUpperCase();
+    const normalizedResponse = raw.replace(/\s+/g, '').toUpperCase();
+    const mode01Match = normalizedCommand.match(/^01([0-9A-F]{2})$/);
+
+    if (mode01Match && normalizedResponse.includes(`41${mode01Match[1]}`)) {
+      this.receivedPidsSet.add(mode01Match[1]);
+      // A real 41xx frame is stronger evidence than an advertised bitmap.
+      // This covers ECUs with incomplete 0100 maps without fabricating data.
+      this.supportedPidsSet.add(mode01Match[1]);
+    } else if (normalizedCommand === 'ATRV' && /(\d+\.?\d*)V/.test(normalizedResponse)) {
+      this.receivedPidsSet.add('ATRV');
+    }
   }
 
   private delay(ms: number) {

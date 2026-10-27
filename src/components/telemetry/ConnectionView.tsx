@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Capacitor } from '@capacitor/core';
 import {
   Bluetooth,
   Car,
@@ -42,6 +43,8 @@ export const ConnectionView: React.FC<ConnectionViewProps> = ({
 
   const isConnected = telemetry.connectionState === 'connected';
   const isSimulated = telemetry.connectionState === 'simulated';
+  const isEcuResponding = telemetry.ecuStatus === 'connected';
+  const isNativeApp = Capacitor.isNativePlatform();
 
   useEffect(() => {
     const unsub = elm327Service.subscribeLogs((log) => {
@@ -160,11 +163,13 @@ export const ConnectionView: React.FC<ConnectionViewProps> = ({
                 <CheckCircle2 className="w-4 h-4" />
                 <span>Escáner ELM327 Enlazado</span>
               </div>
-              <h3 className="text-xl font-bold text-white pt-1">
-                ¡Conexión establecida con la ECU!
-              </h3>
+                <h3 className="text-xl font-bold text-white pt-1">
+                  {isEcuResponding ? '¡Conexión establecida con la ECU!' : 'Adaptador conectado; esperando respuesta de la ECU'}
+                </h3>
               <p className="text-xs sm:text-sm text-slate-300 max-w-md mx-auto">
-                Tu auto está transmitiendo datos de motor, temperatura, batería y diagnóstico en tiempo real.
+                  {isEcuResponding
+                    ? 'Tu auto está transmitiendo datos de motor, temperatura, batería y diagnóstico en tiempo real.'
+                    : 'No se mostrarán valores de ejemplo. Poné el contacto y esperá la respuesta real de la computadora del vehículo.'}
               </p>
             </>
           ) : isConnecting ? (
@@ -219,15 +224,17 @@ export const ConnectionView: React.FC<ConnectionViewProps> = ({
                   <span>{isConnecting ? 'Buscando dispositivos...' : 'Conectar por Bluetooth (ELM327)'}</span>
                 </button>
 
-                <button
-                  onClick={handleConnectSerialClick}
-                  disabled={isConnecting}
-                  className="w-full sm:w-auto px-5 py-3.5 bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 rounded-2xl text-xs font-semibold transition-colors flex items-center justify-center gap-2"
-                  title="Para Notebooks / PCs con Bluetooth emparejado en Windows o adaptador USB"
-                >
-                  <Terminal className="w-4 h-4 text-cyan-400" />
-                  <span>Puerto COM / Notebook</span>
-                </button>
+                {!isNativeApp && (
+                  <button
+                    onClick={handleConnectSerialClick}
+                    disabled={isConnecting}
+                    className="w-full sm:w-auto px-5 py-3.5 bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 rounded-2xl text-xs font-semibold transition-colors flex items-center justify-center gap-2"
+                    title="Para Notebooks / PCs con Bluetooth emparejado en Windows o adaptador USB"
+                  >
+                    <Terminal className="w-4 h-4 text-cyan-400" />
+                    <span>Puerto COM / Notebook</span>
+                  </button>
+                )}
               </div>
 
               <div className="flex items-center justify-center gap-4 pt-1">
@@ -288,9 +295,9 @@ export const ConnectionView: React.FC<ConnectionViewProps> = ({
             <span className="w-6 h-6 rounded-full bg-cyan-500/20 text-cyan-400 font-bold flex items-center justify-center text-xs">
               3
             </span>
-            <h5 className="font-bold text-white">Vinculá y manejá</h5>
+            <h5 className="font-bold text-white">Emparejá y conectá</h5>
             <p className="text-slate-400 leading-relaxed text-[11px]">
-              Tocá el botón "Conectar por Bluetooth". Si te pide PIN, suele ser <strong>1234</strong> o <strong>0000</strong>.
+              En Android, emparejá primero el ELM327 en Ajustes. Si te pide PIN, suele ser <strong>1234</strong> o <strong>0000</strong>; después tocá “Conectar por Bluetooth”.
             </p>
           </div>
         </div>

@@ -40,6 +40,11 @@ export function evaluateSensorHealth(
   const cleanPid = pid.replace(/^01\s*/i, '').trim().toUpperCase();
   const val = numericValue !== undefined && numericValue !== null ? numericValue : extractNumber(currentValueStr);
   const isEngineOn = context?.isEngineRunning ?? (val !== null && val > 0 && cleanPid === '0C');
+  // Con velocidad disponible, más de 2 km/h descarta el ralentí. El pequeño
+  // margen evita que una lectura aislada de 1-2 km/h cambie la interpretación.
+  const speed = context?.speed;
+  const isVehicleMoving = speed !== undefined && speed > 2;
+  const hasSpeedReading = speed !== undefined;
 
   // Si no hay dato o el valor es nulo
   if (val === null || currentValueStr === 'NO DATA' || currentValueStr === 'Sin dato') {
@@ -208,11 +213,13 @@ export function evaluateSensorHealth(
     } else if (val < 220) {
       return {
         status: 'good',
-        statusLabel: 'Normal en Ralentí',
+        statusLabel: isVehicleMoving ? 'Presión Baja a Media en Marcha' : 'Normal en Ralentí',
         badgeColorClass: 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60',
         textColorClass: 'text-emerald-400',
-        simpleExplanation: 'Presión adecuada con el motor regulando en reposo.',
-        idealRangeText: 'Ralentí: 160-250 kPa',
+        simpleExplanation: isVehicleMoving
+          ? 'El vehículo está en movimiento: esta presión debe compararse con las RPM y la carga, no con el ralentí.'
+          : 'Presión adecuada con el motor regulando en reposo.',
+        idealRangeText: isVehicleMoving ? 'En marcha: depende de RPM y temperatura' : 'Ralentí: 160-250 kPa',
         percentInRange: 50,
         isWarningOrDanger: false
       };
@@ -390,7 +397,7 @@ export function evaluateSensorHealth(
         badgeColorClass: 'bg-emerald-950/80 text-emerald-300 border-emerald-600/70',
         textColorClass: 'text-emerald-400',
         simpleExplanation: 'Presión atmosférica estándar (~100 kPa). Entrada de aire limpia y sin restricciones.',
-        idealRangeText: 'Ralentí/reposo: ~100 kPa',
+        idealRangeText: 'Sin turbo/carga: ~100 kPa',
         isWarningOrDanger: false
       };
     } else if (val <= 230) {
@@ -456,11 +463,13 @@ export function evaluateSensorHealth(
     } else if (val <= 20) {
       return {
         status: 'optimal',
-        statusLabel: 'Flujo Normal en Ralentí',
+        statusLabel: isVehicleMoving ? 'Flujo de Baja Carga' : 'Flujo Normal en Ralentí',
         badgeColorClass: 'bg-emerald-950/80 text-emerald-300 border-emerald-600/70',
         textColorClass: 'text-emerald-400',
-        simpleExplanation: 'El motor respira la cantidad exacta de aire para no emitir humo negro.',
-        idealRangeText: 'Ralentí: 8 a 18 g/s',
+        simpleExplanation: isVehicleMoving
+          ? 'El vehículo circula con poca carga. Compará esta lectura con RPM, acelerador y pendiente.'
+          : 'El motor respira la cantidad esperable de aire a baja carga.',
+        idealRangeText: isVehicleMoving ? 'Baja carga: depende de RPM y cambio' : 'Ralentí: 8 a 18 g/s',
         isWarningOrDanger: false
       };
     } else {
@@ -717,11 +726,15 @@ export function evaluateSensorHealth(
     if (val < 5) {
       return {
         status: 'optimal',
-        statusLabel: 'Reposo / Sin Pisar',
+        statusLabel: isVehicleMoving ? 'Pedal Suelto / Retención' : 'Reposo / Sin Pisar',
         badgeColorClass: 'bg-slate-900 text-slate-300 border-slate-700',
         textColorClass: 'text-slate-300',
-        simpleExplanation: 'Pedal suelto, motor regulando sin acelerar.',
-        idealRangeText: 'Reposo: 0% a 5%',
+        simpleExplanation: isVehicleMoving
+          ? 'El auto se está moviendo con el pedal suelto. Puede estar reteniendo; no es ralentí.'
+          : hasSpeedReading
+            ? 'Pedal suelto con el vehículo detenido: el motor puede estar regulando.'
+            : 'Pedal suelto. Sin velocidad disponible no se puede confirmar si está en ralentí.',
+        idealRangeText: isVehicleMoving ? 'Retención: pedal 0% a 5%' : 'Reposo: 0% a 5%',
         isWarningOrDanger: false
       };
     } else if (val <= 50) {
@@ -761,7 +774,17 @@ export function evaluateSensorHealth(
         idealRangeText: 'Parado: 0 RPM',
         isWarningOrDanger: false
       };
-    } else if (val <= 950) {
+    } else if (val <= 950 && isVehicleMoving) {
+      return {
+        status: 'good',
+        statusLabel: 'Régimen Bajo en Marcha',
+        badgeColorClass: 'bg-cyan-950/80 text-cyan-300 border-cyan-700/60',
+        textColorClass: 'text-cyan-300',
+        simpleExplanation: 'El vehículo se mueve, por lo que no es ralentí. RPM bajas con pedal suelto pueden corresponder a retención, embrague o una marcha larga.',
+        idealRangeText: 'En marcha: depende del cambio, pendiente y carga',
+        isWarningOrDanger: false
+      };
+    } else if (val <= 950 && hasSpeedReading) {
       return {
         status: 'optimal',
         statusLabel: 'Ralentí Parejo',
@@ -769,6 +792,16 @@ export function evaluateSensorHealth(
         textColorClass: 'text-emerald-400',
         simpleExplanation: 'El motor regula suavemente sin vibraciones ni tironeos.',
         idealRangeText: 'Ralentí: 650 a 900 RPM',
+        isWarningOrDanger: false
+      };
+    } else if (val <= 950) {
+      return {
+        status: 'good',
+        statusLabel: 'RPM Bajas',
+        badgeColorClass: 'bg-cyan-950/80 text-cyan-300 border-cyan-700/60',
+        textColorClass: 'text-cyan-300',
+        simpleExplanation: 'La velocidad no está disponible, así que no se puede asegurar que sea ralentí.',
+        idealRangeText: 'Ralentí solo se confirma con vehículo detenido',
         isWarningOrDanger: false
       };
     } else if (val <= 2800) {
